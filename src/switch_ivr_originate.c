@@ -1860,8 +1860,8 @@ SWITCH_DECLARE(switch_status_t) switch_ivr_enterprise_originate(switch_core_sess
 		switch_thread_join(&tstatus, handles[i].thread);
 		switch_event_destroy(&handles[i].ovars);
 		switch_dial_handle_destroy(&handles[i].dh);
-		switch_thread_cond_destroy(handles[i]->cond);
-		switch_mutex_destroy(handles[i]->mutex);
+		switch_thread_cond_destroy(handles[i].cond);
+		switch_mutex_destroy(handles[i].mutex);
 	}
 
 	if (channel && rb_data.thread) {
