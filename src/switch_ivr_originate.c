@@ -1849,7 +1849,7 @@ SWITCH_DECLARE(switch_status_t) switch_ivr_enterprise_originate(switch_core_sess
 		switch_mutex_lock(hp->mutex);
 		hp->done = -1;
 		switch_thread_cond_signal(hp->cond);
-		cause = handles[i].cause;
+		*cause = handles[i].cause;
 		switch_mutex_unlock(hp->mutex);
 
 		if (getcause && *cause != h_cause && h_cause != SWITCH_CAUSE_LOSE_RACE && h_cause != SWITCH_CAUSE_NO_PICKUP) {
