@@ -1465,6 +1465,7 @@ typedef struct {
 	int done;
 	switch_thread_t *thread;
 	switch_mutex_t *mutex;
+	switch_thread_cond_t *cond;
 	switch_dial_handle_t *dh;
 } enterprise_originate_handle_t;
 
@@ -1479,9 +1480,14 @@ struct ent_originate_ringback {
 static void *SWITCH_THREAD_FUNC enterprise_originate_thread(switch_thread_t *thread, void *obj)
 {
 	enterprise_originate_handle_t *handle = (enterprise_originate_handle_t *) obj;
+	switch_status_t status;
+	switch_core_session_t *bleg = NULL;
+	switch_call_cause_t cause = 0;
+	int done = 0;
 
-	handle->done = 0;
-	handle->status = switch_ivr_originate(NULL, &handle->bleg, &handle->cause,
+	// we can safely read from handle since no one else is writing to it, but
+	// our writes to it need to happen while the mutex is locked.
+	status = switch_ivr_originate(NULL, &bleg, &cause,
 										  handle->bridgeto, handle->timelimit_sec,
 										  handle->table,
 										  handle->cid_name_override,
@@ -1492,18 +1498,32 @@ static void *SWITCH_THREAD_FUNC enterprise_originate_thread(switch_thread_t *thr
 										  &handle->cancel_cause,
 										  handle->dh);
 
-
-	handle->done = 1;
 	switch_mutex_lock(handle->mutex);
+	handle->status= status;
+	handle->bleg = bleg;
+	handle->cause = cause;
+
+	// The parent thread will set done to 2 if we are the winning leg, and -1 if
+	// we lose. If we haven't already lost, set done to 1 and wait for the
+	// parent to tell us if we've won or not.
+	if (handle->done == 0) {
+		handle->done = 1;
+		// Spurious wakeups may occur; need to call cond_wait in a loop
+		while (handle->done == 1) {
+			switch_thread_cond_wait(handle->cond, handle->mutex);
+		}
+	}
+	done = handle->done;
 	switch_mutex_unlock(handle->mutex);
 
-	if (handle->done != 2) {
-		if (handle->status == SWITCH_STATUS_SUCCESS && handle->bleg) {
-			switch_channel_t *channel = switch_core_session_get_channel(handle->bleg);
+	// hangup the losing leg
+	if (done != 2) {
+		if (status == SWITCH_STATUS_SUCCESS && bleg) {
+			switch_channel_t *channel = switch_core_session_get_channel(bleg);
 
 			switch_channel_set_variable(channel, "group_dial_status", "loser");
 			switch_channel_hangup(channel, SWITCH_CAUSE_LOSE_RACE);
-			switch_core_session_rwunlock(handle->bleg);
+			switch_core_session_rwunlock(bleg);
 		}
 	}
 
@@ -1681,6 +1701,8 @@ SWITCH_DECLARE(switch_status_t) switch_ivr_enterprise_originate(switch_core_sess
 	switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
 
 	for (i = 0; i < x_argc; i++) {
+		handles[i].status = SWITCH_STATUS_NOT_INITALIZED;
+		handles[i].done = 0;
 		handles[i].session = session;
 		handles[i].bleg = NULL;
 		handles[i].cause = 0;
@@ -1697,7 +1719,7 @@ SWITCH_DECLARE(switch_status_t) switch_ivr_enterprise_originate(switch_core_sess
 			switch_dial_handle_dup(&handles[i].dh, hl->handles[i]);
 		}
 		switch_mutex_init(&handles[i].mutex, SWITCH_MUTEX_NESTED, pool);
-		switch_mutex_lock(handles[i].mutex);
+		switch_thread_cond_create(&handles[i].cond, pool);
 		switch_thread_create(&handles[i].thread, thd_attr, enterprise_originate_thread, &handles[i], pool);
 	}
 
@@ -1737,7 +1759,7 @@ SWITCH_DECLARE(switch_status_t) switch_ivr_enterprise_originate(switch_core_sess
 		}
 
 		for (i = 0; i < x_argc; i++) {
-
+			switch_mutex_lock(handles[i].mutex);
 
 			if (handles[i].done == 0) {
 				running++;
@@ -1745,6 +1767,7 @@ SWITCH_DECLARE(switch_status_t) switch_ivr_enterprise_originate(switch_core_sess
 				if (handles[i].status == SWITCH_STATUS_SUCCESS) {
 					handles[i].done = 2;
 					hp = &handles[i];
+					switch_mutex_unlock(handles[i].mutex);
 					goto done;
 				} else {
 					handles[i].done = -1;
@@ -1753,6 +1776,7 @@ SWITCH_DECLARE(switch_status_t) switch_ivr_enterprise_originate(switch_core_sess
 				over++;
 			}
 
+			switch_mutex_unlock(handles[i].mutex);
 			switch_yield(10000);
 		}
 
@@ -1781,10 +1805,17 @@ SWITCH_DECLARE(switch_status_t) switch_ivr_enterprise_originate(switch_core_sess
 				switch_channel_set_originatee_caller_profile(channel, cloned_profile);
 			}
 		}
+
+		// wake up the child thread so we can clean up
+		switch_mutex_lock(hp->mutex);
+		switch_thread_cond_signal(hp->cond);
 		switch_mutex_unlock(hp->mutex);
+
 		switch_thread_join(&tstatus, hp->thread);
 		switch_event_destroy(&hp->ovars);
 		switch_dial_handle_destroy(&hp->dh);
+		switch_thread_cond_destroy(hp->cond);
+		switch_mutex_destroy(hp->mutex);
 	}
 
 	for (i = 0; i < x_argc; i++) {
@@ -1800,25 +1831,37 @@ SWITCH_DECLARE(switch_status_t) switch_ivr_enterprise_originate(switch_core_sess
 	}
 
 	for (i = 0; i < x_argc; i++) {
+		switch_call_cause_t h_cause;
 
 		if (hp == &handles[i]) {
 			continue;
 		}
 
-		if (getcause && channel && handles[i].cause && handles[i].cause != SWITCH_CAUSE_SUCCESS) {
-			switch_channel_handle_cause(channel, handles[i].cause);
+		switch_mutex_lock(hp->mutex);
+		h_cause = handles[i].cause;
+		switch_mutex_unlock(hp->mutex);
+
+		if (getcause && channel && h_cause && h_cause != SWITCH_CAUSE_SUCCESS) {
+			switch_channel_handle_cause(channel, h_cause);
 		}
 
-		switch_mutex_unlock(handles[i].mutex);
+		// let child thread know it lost
+		switch_mutex_lock(hp->mutex);
+		hp->done = -1;
+		switch_thread_cond_signal(hp->cond);
+		cause = handles[i].cause;
+		switch_mutex_unlock(hp->mutex);
 
-		if (getcause && *cause != handles[i].cause && handles[i].cause != SWITCH_CAUSE_LOSE_RACE && handles[i].cause != SWITCH_CAUSE_NO_PICKUP) {
-			*cause = handles[i].cause;
+		if (getcause && *cause != h_cause && h_cause != SWITCH_CAUSE_LOSE_RACE && h_cause != SWITCH_CAUSE_NO_PICKUP) {
+			*cause = h_cause;
 			getcause++;
 		}
 
 		switch_thread_join(&tstatus, handles[i].thread);
 		switch_event_destroy(&handles[i].ovars);
 		switch_dial_handle_destroy(&handles[i].dh);
+		switch_thread_cond_destroy(handles[i]->cond);
+		switch_mutex_destroy(handles[i]->mutex);
 	}
 
 	if (channel && rb_data.thread) {
